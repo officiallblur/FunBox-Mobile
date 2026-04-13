@@ -1,0 +1,116 @@
+name: FunBox Scraper
+
+on:
+  schedule:
+    - cron: '0 11,23 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Run without writing to Supabase'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'false'
+          - 'true'
+      max_urls:
+        description: 'Optional override for MAX_URLS'
+        required: false
+        default: ''
+        type: string
+      lastmod_days:
+        description: 'Optional override for LASTMOD_DAYS'
+        required: false
+        default: ''
+        type: string
+      log_level:
+        description: 'Optional override for LOG_LEVEL'
+        required: false
+        default: ''
+        type: choice
+        options:
+          - ''
+          - DEBUG
+          - INFO
+          - WARNING
+          - ERROR
+
+permissions:
+  contents: read
+
+concurrency:
+  group: funbox-scraper
+  cancel-in-progress: false
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    defaults:
+      run:
+        working-directory: scraper
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
+      SCRAPER_MAX_URLS: ${{ vars.SCRAPER_MAX_URLS }}
+      SCRAPER_DRY_RUN: ${{ vars.SCRAPER_DRY_RUN }}
+      SCRAPER_LASTMOD_DAYS: ${{ vars.SCRAPER_LASTMOD_DAYS }}
+      SCRAPER_THROTTLE_SECONDS: ${{ vars.SCRAPER_THROTTLE_SECONDS }}
+      SCRAPER_JITTER_SECONDS: ${{ vars.SCRAPER_JITTER_SECONDS }}
+      SCRAPER_LOG_LEVEL: ${{ vars.SCRAPER_LOG_LEVEL }}
+      INPUT_DRY_RUN: ${{ inputs.dry_run }}
+      INPUT_MAX_URLS: ${{ inputs.max_urls }}
+      INPUT_LASTMOD_DAYS: ${{ inputs.lastmod_days }}
+      INPUT_LOG_LEVEL: ${{ inputs.log_level }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: scraper/requirements.txt
+
+      - name: Install Python dependencies
+        run: pip install --no-cache-dir -r requirements.txt
+
+      - name: Install Playwright Chromium
+        run: python -m playwright install --with-deps chromium
+
+      - name: Validate required secrets
+        shell: bash
+        run: |
+          test -n "$SUPABASE_URL" || { echo "Missing GitHub secret: SUPABASE_URL"; exit 1; }
+          test -n "$SUPABASE_SERVICE_ROLE_KEY" || { echo "Missing GitHub secret: SUPABASE_SERVICE_ROLE_KEY"; exit 1; }
+          test -n "$TMDB_API_KEY" || { echo "Missing GitHub secret: TMDB_API_KEY"; exit 1; }
+
+      - name: Run scraper
+        shell: bash
+        run: |
+          MAX_URLS_VALUE="${INPUT_MAX_URLS:-${SCRAPER_MAX_URLS:-200}}"
+          DRY_RUN_VALUE="${INPUT_DRY_RUN:-${SCRAPER_DRY_RUN:-false}}"
+          LASTMOD_DAYS_VALUE="${INPUT_LASTMOD_DAYS:-${SCRAPER_LASTMOD_DAYS:-14}}"
+          THROTTLE_VALUE="${SCRAPER_THROTTLE_SECONDS:-1.2}"
+          JITTER_VALUE="${SCRAPER_JITTER_SECONDS:-0.4}"
+          LOG_LEVEL_VALUE="${INPUT_LOG_LEVEL:-${SCRAPER_LOG_LEVEL:-INFO}}"
+
+          export MAX_URLS="$MAX_URLS_VALUE"
+          export DRY_RUN="$DRY_RUN_VALUE"
+          export LASTMOD_DAYS="$LASTMOD_DAYS_VALUE"
+          export THROTTLE_SECONDS="$THROTTLE_VALUE"
+          export JITTER_SECONDS="$JITTER_VALUE"
+          export LOG_LEVEL="$LOG_LEVEL_VALUE"
+
+          echo "Starting scraper with MAX_URLS=$MAX_URLS DRY_RUN=$DRY_RUN LASTMOD_DAYS=$LASTMOD_DAYS LOG_LEVEL=$LOG_LEVEL"
+          python main.py 2>&1 | tee scraper-run.log
+
+      - name: Upload scraper log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: funbox-scraper-log-${{ github.run_id }}
+          path: scraper/scraper-run.log
+          if-no-files-found: ignore
