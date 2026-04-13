@@ -36,7 +36,7 @@ The repository now includes a scheduled workflow at `.github/workflows/funbox-sc
 5. Use **Run workflow** for your first smoke test with:
    - `dry_run=true`
    - `max_urls=3`
-   - `lastmod_days=3`
+   - `lastmod_days=0`
    - `log_level=DEBUG`
 6. After the smoke test passes, run again with `dry_run=false`
 
