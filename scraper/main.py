@@ -35,9 +35,29 @@ LASTMOD_DAYS = int(os.getenv("LASTMOD_DAYS", "14"))
 THROTTLE_SECONDS = float(os.getenv("THROTTLE_SECONDS", "1.2"))
 JITTER_SECONDS = float(os.getenv("JITTER_SECONDS", "0.4"))
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+SCRAPER_USER_AGENT = os.getenv(
+    "SCRAPER_USER_AGENT",
+    (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/124.0.0.0 Safari/537.36"
+    ),
+)
 
 EP_RE = re.compile(r"(?:S|Season)\s?(\d{1,2})[^\d]?(?:E|Episode)\s?(\d{1,3})", re.I)
 SXXEYY = re.compile(r"S(\d{1,2})E(\d{1,3})", re.I)
+RESOLUTION_ERROR_MARKERS = (
+    "name or service not known",
+    "err_name_not_resolved",
+    "enotfound",
+    "dns",
+)
+HOSTNAME_VARIANTS = {
+    "net9jaseries.com": ["www.net9jaseries.com"],
+    "www.net9jaseries.com": ["net9jaseries.com"],
+    "net9ja.com.ng": ["www.net9ja.com.ng"],
+    "www.net9ja.com.ng": ["net9ja.com.ng"],
+}
 
 logging.basicConfig(
     level=LOG_LEVEL,
@@ -55,7 +75,15 @@ retry = Retry(
 adapter = HTTPAdapter(max_retries=retry)
 session.mount("https://", adapter)
 session.mount("http://", adapter)
-session.headers.update({"User-Agent": "FunBoxScraper/1.0"})
+session.headers.update(
+    {
+        "User-Agent": SCRAPER_USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+)
 
 
 def fetch_xml(url: str) -> str:
@@ -135,6 +163,39 @@ def parse_sitemap_entries(url: str) -> list[dict]:
     return entries
 
 
+def should_scrape_url(url: str) -> bool:
+    parsed = urlparse(url)
+    path = parsed.path.strip("/")
+    if not path:
+        return False
+    blocked_prefixes = (
+        "category/",
+        "tag/",
+        "page/",
+        "author/",
+        "notice",
+    )
+    return not any(path.startswith(prefix) for prefix in blocked_prefixes)
+
+
+def is_resolution_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return any(marker in message for marker in RESOLUTION_ERROR_MARKERS)
+
+
+def build_candidate_urls(url: str) -> list[str]:
+    parsed = urlparse(url)
+    hosts = [parsed.netloc, *HOSTNAME_VARIANTS.get(parsed.netloc, [])]
+    candidates: list[str] = []
+    for host in hosts:
+        if not host:
+            continue
+        candidate = parsed._replace(netloc=host).geturl()
+        if candidate not in candidates:
+            candidates.append(candidate)
+    return candidates or [url]
+
+
 def collect_urls() -> list[str]:
     urls: list[str] = []
     cutoff = None
@@ -163,17 +224,17 @@ def collect_urls() -> list[str]:
                             logger.info("Skipping stale child sitemap: %s", child_loc)
                             continue
                         for grand in parse_sitemap_entries(child_loc):
-                            if is_recent(grand.get("lastmod"), cutoff):
+                            if is_recent(grand.get("lastmod"), cutoff) and should_scrape_url(grand["loc"]):
                                 urls.append(grand["loc"])
                             else:
                                 logger.debug("Skipping stale url: %s", grand["loc"])
                     else:
-                        if is_recent(child.get("lastmod"), cutoff):
+                        if is_recent(child.get("lastmod"), cutoff) and should_scrape_url(child_loc):
                             urls.append(child_loc)
                         else:
                             logger.debug("Skipping stale url: %s", child_loc)
             else:
-                if is_recent(entry.get("lastmod"), cutoff):
+                if is_recent(entry.get("lastmod"), cutoff) and should_scrape_url(loc):
                     urls.append(loc)
                 else:
                     logger.debug("Skipping stale url: %s", loc)
@@ -224,8 +285,17 @@ def extract_links(soup: BeautifulSoup) -> list[str]:
     links: list[str] = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
+        text = a.get_text(" ", strip=True).lower()
+        href_lower = href.lower()
         host = urlparse(href).netloc.replace("www.", "")
         if host in DOWNLOAD_HOSTS:
+            if host in {"net9ja.com.ng", "net9jaseries.com"}:
+                # Same-domain links are only useful when they clearly look like download targets.
+                if not any(
+                    marker in href_lower or marker in text
+                    for marker in ("download", "480p", "720p", "1080p", "x264", "x265", "mkv", "mp4")
+                ):
+                    continue
             links.append(href)
         elif any(href.lower().endswith(ext) for ext in [".mkv", ".mp4", ".avi", ".m3u8"]):
             links.append(href)
@@ -256,17 +326,54 @@ def upsert_episode(supabase, payload: dict):
     supabase.table("series_links").insert(payload).execute()
 
 
-def goto_with_retry(page, url: str, attempts: int = 3):
-    for attempt in range(1, attempts + 1):
-        try:
-            page.goto(url, wait_until="networkidle", timeout=45000)
-            return
-        except Exception as exc:
-            if attempt >= attempts:
-                raise
-            backoff = min(2**attempt, 8)
-            logger.warning("Playwright retry %s/%s for %s: %s", attempt, attempts, url, exc)
-            time.sleep(backoff)
+def fetch_html_with_requests(url: str, attempts: int = 2) -> tuple[str, str]:
+    last_exc: Exception | None = None
+    for candidate in build_candidate_urls(url):
+        for attempt in range(1, attempts + 1):
+            try:
+                response = session.get(candidate, timeout=45)
+                response.raise_for_status()
+                return response.text, response.url
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= attempts:
+                    logger.warning("Requests failed for %s: %s", candidate, exc)
+                    break
+                backoff = min(2**attempt, 6)
+                logger.warning("Requests retry %s/%s for %s: %s", attempt, attempts, candidate, exc)
+                time.sleep(backoff)
+        if last_exc and not is_resolution_error(last_exc):
+            break
+    if last_exc:
+        raise last_exc
+    raise RuntimeError(f"Failed to fetch page via requests: {url}")
+
+
+def goto_with_retry(page, url: str, attempts: int = 2) -> tuple[str, str]:
+    last_exc: Exception | None = None
+    for candidate in build_candidate_urls(url):
+        for attempt in range(1, attempts + 1):
+            try:
+                page.goto(candidate, wait_until="domcontentloaded", timeout=45000)
+                try:
+                    page.wait_for_load_state("networkidle", timeout=10000)
+                except Exception:
+                    # Some source pages keep background requests alive; DOM content is enough for parsing.
+                    pass
+                return page.content(), page.url
+            except Exception as exc:
+                last_exc = exc
+                if attempt >= attempts:
+                    logger.warning("Playwright failed for %s: %s", candidate, exc)
+                    break
+                backoff = min(2**attempt, 8)
+                logger.warning("Playwright retry %s/%s for %s: %s", attempt, attempts, candidate, exc)
+                time.sleep(backoff)
+        if last_exc and not is_resolution_error(last_exc):
+            break
+    if last_exc:
+        raise last_exc
+    raise RuntimeError(f"Failed to fetch page via Playwright: {url}")
 
 
 def throttle():
@@ -278,9 +385,7 @@ def throttle():
     time.sleep(delay)
 
 
-def scrape_page(page, url: str) -> tuple[str, str, str | None, list[str]]:
-    goto_with_retry(page, url)
-    html = page.content()
+def parse_page_payload(html: str) -> tuple[str, str, str | None, list[str]]:
     soup = BeautifulSoup(html, "lxml")
 
     title = clean_title(
@@ -302,6 +407,25 @@ def scrape_page(page, url: str) -> tuple[str, str, str | None, list[str]]:
     return title, description, poster, links
 
 
+def scrape_page(page, url: str) -> tuple[str, str, str | None, list[str]]:
+    try:
+        html, resolved_url = fetch_html_with_requests(url)
+        title, description, poster, links = parse_page_payload(html)
+        if title and links:
+            if resolved_url != url:
+                logger.info("Resolved %s via requests as %s", url, resolved_url)
+            return title, description, poster, links
+        logger.warning("Requests fetch for %s returned incomplete data; retrying with Playwright", resolved_url)
+    except Exception as exc:
+        logger.warning("Requests fetch failed for %s: %s", url, exc)
+
+    html, resolved_url = goto_with_retry(page, url)
+    title, description, poster, links = parse_page_payload(html)
+    if resolved_url != url:
+        logger.info("Resolved %s via Playwright as %s", url, resolved_url)
+    return title, description, poster, links
+
+
 def main():
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         raise RuntimeError("Missing Supabase credentials.")
@@ -312,7 +436,7 @@ def main():
 
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
-        page = browser.new_page()
+        page = browser.new_page(user_agent=SCRAPER_USER_AGENT)
         for idx, url in enumerate(urls, 1):
             try:
                 title, description, poster, links = scrape_page(page, url)
