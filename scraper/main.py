@@ -11,6 +11,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
 from playwright.sync_api import sync_playwright
+from requests_toolbelt.adapters.host_header_ssl import HostHeaderSSLAdapter
 
 SITEMAPS = [
     "https://net9jaseries.com/sitemap_index.xml",
@@ -44,6 +45,7 @@ SCRAPER_USER_AGENT = os.getenv(
 )
 SUPABASE_WRITE_ATTEMPTS = int(os.getenv("SUPABASE_WRITE_ATTEMPTS", "5"))
 SUPABASE_WRITE_BACKOFF_SECONDS = float(os.getenv("SUPABASE_WRITE_BACKOFF_SECONDS", "2"))
+SUPABASE_DOH_ATTEMPTS = int(os.getenv("SUPABASE_DOH_ATTEMPTS", "2"))
 
 EP_RE = re.compile(r"(?:S|Season)\s?(\d{1,2})[^\d]?(?:E|Episode)\s?(\d{1,3})", re.I)
 SXXEYY = re.compile(r"S(\d{1,2})E(\d{1,3})", re.I)
@@ -86,12 +88,130 @@ session.headers.update(
     }
 )
 SUPABASE_REST_BASE = f"{SUPABASE_URL.rstrip('/')}/rest/v1" if SUPABASE_URL else ""
+SUPABASE_HOST = urlparse(SUPABASE_URL).hostname or ""
+
+supabase_ip_session = requests.Session()
+supabase_ip_session.mount("https://", HostHeaderSSLAdapter(max_retries=retry))
+supabase_ip_session.mount("http://", adapter)
+supabase_ip_session.headers.update(
+    {
+        "User-Agent": SCRAPER_USER_AGENT,
+        "Accept": "application/json",
+    }
+)
+_supabase_ip_cache: list[str] = []
 
 
 def fetch_xml(url: str) -> str:
     res = session.get(url, timeout=30)
     res.raise_for_status()
     return res.text
+
+
+def resolve_hostname_via_doh(hostname: str) -> list[str]:
+    if not hostname:
+        return []
+    if _supabase_ip_cache:
+        return list(_supabase_ip_cache)
+
+    providers = (
+        (
+            "google",
+            "https://dns.google/resolve",
+            {"name": hostname, "type": "A"},
+            {"Accept": "application/json"},
+        ),
+        (
+            "cloudflare",
+            "https://cloudflare-dns.com/dns-query",
+            {"name": hostname, "type": "A"},
+            {"Accept": "application/dns-json"},
+        ),
+    )
+
+    for provider_name, provider_url, params, headers in providers:
+        for attempt in range(1, SUPABASE_DOH_ATTEMPTS + 1):
+            try:
+                response = session.get(provider_url, params=params, headers=headers, timeout=20)
+                response.raise_for_status()
+                payload = response.json()
+                answers = payload.get("Answer") or []
+                ips: list[str] = []
+                for answer in answers:
+                    if answer.get("type") == 1 and answer.get("data"):
+                        ip = str(answer["data"]).strip()
+                        if ip and ip not in ips:
+                            ips.append(ip)
+                if ips:
+                    _supabase_ip_cache[:] = ips
+                    logger.warning(
+                        "Resolved %s via %s DoH fallback: %s",
+                        hostname,
+                        provider_name,
+                        ", ".join(ips),
+                    )
+                    return list(_supabase_ip_cache)
+            except Exception as exc:
+                logger.warning(
+                    "DoH lookup retry %s/%s via %s for %s failed: %s",
+                    attempt,
+                    SUPABASE_DOH_ATTEMPTS,
+                    provider_name,
+                    hostname,
+                    exc,
+                )
+                if attempt < SUPABASE_DOH_ATTEMPTS:
+                    time.sleep(attempt)
+
+    return []
+
+
+def build_ip_url(url: str, ip: str) -> str:
+    parsed = urlparse(url)
+    netloc = ip
+    if parsed.port:
+        netloc = f"{ip}:{parsed.port}"
+    return parsed._replace(netloc=netloc).geturl()
+
+
+def supabase_request_via_ip(
+    method: str,
+    url: str,
+    *,
+    params: dict | None = None,
+    payload: list[dict] | None = None,
+    headers: dict | None = None,
+) -> list[dict] | None:
+    host = urlparse(url).hostname or SUPABASE_HOST
+    ips = resolve_hostname_via_doh(host)
+    if not ips:
+        raise RuntimeError(f"Unable to resolve {host} via DoH fallback.")
+
+    last_exc: Exception | None = None
+    for ip in ips:
+        try:
+            request_headers = dict(headers or {})
+            request_headers["Host"] = host
+            response = supabase_ip_session.request(
+                method,
+                build_ip_url(url, ip),
+                params=params,
+                json=payload,
+                headers=request_headers,
+                timeout=45,
+            )
+            response.raise_for_status()
+            if not response.content:
+                return None
+            logger.warning("Supabase %s succeeded via IP fallback %s", method, ip)
+            return response.json()
+        except Exception as exc:
+            last_exc = exc
+            logger.warning("Supabase IP fallback via %s failed: %s", ip, exc)
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError(f"Supabase IP fallback failed for {host}")
 
 
 def supabase_request(
@@ -122,6 +242,17 @@ def supabase_request(
             return response.json()
         except Exception as exc:
             last_exc = exc
+            if is_resolution_error(exc):
+                try:
+                    return supabase_request_via_ip(
+                        method,
+                        url,
+                        params=params,
+                        payload=payload,
+                        headers=headers,
+                    )
+                except Exception as fallback_exc:
+                    last_exc = fallback_exc
             if attempt >= SUPABASE_WRITE_ATTEMPTS:
                 break
             backoff = max(1.0, SUPABASE_WRITE_BACKOFF_SECONDS * attempt)

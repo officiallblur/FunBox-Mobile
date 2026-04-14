@@ -14,6 +14,9 @@ LASTMOD_DAYS=14
 THROTTLE_SECONDS=1.2
 JITTER_SECONDS=0.4
 LOG_LEVEL=INFO
+SUPABASE_WRITE_ATTEMPTS=5
+SUPABASE_WRITE_BACKOFF_SECONDS=2
+SUPABASE_DOH_ATTEMPTS=2
 ```
 
 ## GitHub Actions Setup
@@ -32,6 +35,9 @@ The repository now includes a scheduled workflow at `.github/workflows/funbox-sc
    - `SCRAPER_THROTTLE_SECONDS`
    - `SCRAPER_JITTER_SECONDS`
    - `SCRAPER_LOG_LEVEL`
+   - `SCRAPER_SUPABASE_WRITE_ATTEMPTS`
+   - `SCRAPER_SUPABASE_WRITE_BACKOFF_SECONDS`
+   - `SCRAPER_SUPABASE_DOH_ATTEMPTS`
 4. Open **Actions -> FunBox Scraper**
 5. Use **Run workflow** for your first smoke test with:
    - `dry_run=true`
@@ -60,4 +66,5 @@ The GitHub Actions workflow is scheduled in **UTC**:
 - This uses the Supabase **service role key** and must run server-side only.
 - Direct download links can expire; the scraper re-runs twice daily to refresh.
 - If the sitemap provides `lastmod`, the scraper will skip pages older than `LASTMOD_DAYS` days.
+- Supabase writes automatically retry and can fall back to DNS-over-HTTPS if the runner's default DNS lookup flakes out.
 - The mobile app still reads scraped links from Supabase, so switching the scheduler from Render to GitHub Actions does not require app-side Render URLs.
