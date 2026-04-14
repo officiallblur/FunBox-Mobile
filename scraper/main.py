@@ -10,7 +10,6 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from bs4 import BeautifulSoup
-from supabase import create_client
 from playwright.sync_api import sync_playwright
 
 SITEMAPS = [
@@ -84,12 +83,38 @@ session.headers.update(
         "Pragma": "no-cache",
     }
 )
+SUPABASE_REST_BASE = f"{SUPABASE_URL.rstrip('/')}/rest/v1" if SUPABASE_URL else ""
 
 
 def fetch_xml(url: str) -> str:
     res = session.get(url, timeout=30)
     res.raise_for_status()
     return res.text
+
+
+def supabase_request(
+    method: str,
+    table: str,
+    *,
+    params: dict | None = None,
+    payload: list[dict] | None = None,
+) -> list[dict] | None:
+    if not SUPABASE_REST_BASE or not SUPABASE_SERVICE_ROLE_KEY:
+        raise RuntimeError("Missing Supabase REST configuration.")
+
+    url = f"{SUPABASE_REST_BASE}/{table}"
+    headers = {
+        "apikey": SUPABASE_SERVICE_ROLE_KEY,
+        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+    response = session.request(method, url, params=params, json=payload, headers=headers, timeout=45)
+    response.raise_for_status()
+    if not response.content:
+        return None
+    return response.json()
 
 
 def parse_lastmod(value: str | None) -> datetime | None:
@@ -306,24 +331,32 @@ def is_series_page(title: str, links: list[str]) -> bool:
     return "season" in title.lower() or len(links) > 1
 
 
-def upsert_movie(supabase, payload: dict):
+def upsert_movie(payload: dict):
     if DRY_RUN:
         logger.info("DRY RUN movie: %s", payload)
         return
-    existing = supabase.table("download_links").select("id").eq("url", payload["url"]).limit(1).execute()
-    if existing.data:
+    existing = supabase_request(
+        "GET",
+        "download_links",
+        params={"select": "id", "url": f"eq.{payload['url']}", "limit": "1"},
+    )
+    if existing:
         return
-    supabase.table("download_links").insert(payload).execute()
+    supabase_request("POST", "download_links", payload=[payload])
 
 
-def upsert_episode(supabase, payload: dict):
+def upsert_episode(payload: dict):
     if DRY_RUN:
         logger.info("DRY RUN episode: %s", payload)
         return
-    existing = supabase.table("series_links").select("id").eq("url", payload["url"]).limit(1).execute()
-    if existing.data:
+    existing = supabase_request(
+        "GET",
+        "series_links",
+        params={"select": "id", "url": f"eq.{payload['url']}", "limit": "1"},
+    )
+    if existing:
         return
-    supabase.table("series_links").insert(payload).execute()
+    supabase_request("POST", "series_links", payload=[payload])
 
 
 def fetch_html_with_requests(url: str, attempts: int = 2) -> tuple[str, str]:
@@ -430,7 +463,6 @@ def main():
     if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
         raise RuntimeError("Missing Supabase credentials.")
 
-    supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
     urls = collect_urls()
     logger.info("Scraping %d urls...", len(urls))
 
@@ -438,6 +470,7 @@ def main():
         browser = p.chromium.launch(headless=True)
         page = browser.new_page(user_agent=SCRAPER_USER_AGENT)
         for idx, url in enumerate(urls, 1):
+            stage = "scrape"
             try:
                 title, description, poster, links = scrape_page(page, url)
                 if not title or not links:
@@ -445,10 +478,12 @@ def main():
                     throttle()
                     continue
 
+                stage = "classify"
                 series = is_series_page(title, links)
                 source_domain = urlparse(url).netloc.replace("www.", "")
 
                 if series:
+                    stage = "tmdb-tv"
                     tmdb = tmdb_search("tv", title)
                     tv_id = tmdb["id"] if tmdb else None
                     poster_url = tmdb_poster(tmdb.get("poster_path")) if tmdb else poster
@@ -468,8 +503,10 @@ def main():
                             "poster": poster_url,
                             "source": source_domain,
                         }
-                        upsert_episode(supabase, payload)
+                        stage = f"upsert-episode:{link}"
+                        upsert_episode(payload)
                 else:
+                    stage = "tmdb-movie"
                     tmdb = tmdb_search("movie", title)
                     movie_id = tmdb["id"] if tmdb else None
                     poster_url = tmdb_poster(tmdb.get("poster_path")) if tmdb else poster
@@ -481,12 +518,13 @@ def main():
                             "poster": poster_url,
                             "movie_id": movie_id,
                         }
-                        upsert_movie(supabase, payload)
+                        stage = f"upsert-movie:{link}"
+                        upsert_movie(payload)
 
                 logger.info("[%s/%s] OK: %s", idx, len(urls), title)
                 throttle()
             except Exception as e:
-                logger.error("[%s/%s] FAIL %s: %s", idx, len(urls), url, e)
+                logger.error("[%s/%s] FAIL %s during %s: %s", idx, len(urls), url, stage, e)
                 throttle()
 
         browser.close()
