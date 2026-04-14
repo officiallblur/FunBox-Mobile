@@ -42,6 +42,8 @@ SCRAPER_USER_AGENT = os.getenv(
         "Chrome/124.0.0.0 Safari/537.36"
     ),
 )
+SUPABASE_WRITE_ATTEMPTS = int(os.getenv("SUPABASE_WRITE_ATTEMPTS", "5"))
+SUPABASE_WRITE_BACKOFF_SECONDS = float(os.getenv("SUPABASE_WRITE_BACKOFF_SECONDS", "2"))
 
 EP_RE = re.compile(r"(?:S|Season)\s?(\d{1,2})[^\d]?(?:E|Episode)\s?(\d{1,3})", re.I)
 SXXEYY = re.compile(r"S(\d{1,2})E(\d{1,3})", re.I)
@@ -110,11 +112,32 @@ def supabase_request(
         "Content-Type": "application/json",
         "Prefer": "return=representation",
     }
-    response = session.request(method, url, params=params, json=payload, headers=headers, timeout=45)
-    response.raise_for_status()
-    if not response.content:
-        return None
-    return response.json()
+    last_exc: Exception | None = None
+    for attempt in range(1, SUPABASE_WRITE_ATTEMPTS + 1):
+        try:
+            response = session.request(method, url, params=params, json=payload, headers=headers, timeout=45)
+            response.raise_for_status()
+            if not response.content:
+                return None
+            return response.json()
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= SUPABASE_WRITE_ATTEMPTS:
+                break
+            backoff = max(1.0, SUPABASE_WRITE_BACKOFF_SECONDS * attempt)
+            logger.warning(
+                "Supabase %s retry %s/%s for %s: %s",
+                method,
+                attempt,
+                SUPABASE_WRITE_ATTEMPTS,
+                table,
+                exc,
+            )
+            time.sleep(backoff)
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError(f"Supabase request failed for table {table}")
 
 
 def parse_lastmod(value: str | None) -> datetime | None:
